@@ -14,6 +14,7 @@ This is an introductory-level repository meant for individuals who want to gain 
 
 ## Architecture
 </br>
+
 ![Architecture Diagram](/images/Architecture.png)
 
 ## Semantic Search Engine and Retrieval-Augmented Generation (RAG)
