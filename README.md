@@ -69,8 +69,10 @@ In order to avoid incurring any cost and as a general best practice, please foll
 
 ## Security
 </br>
+
 See the [CONTRIBUTING](CONTRIBUTING.md) file for more information.
 
 ## License
 </br>
+
 See the [LICENSE](LICENSE) file for our project's licensing.
