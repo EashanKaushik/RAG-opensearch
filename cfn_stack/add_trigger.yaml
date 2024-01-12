@@ -1,0 +1,911 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description:  This template deploys two S3 Buckets, Lambda functions with appropriate roles
+
+Parameters:
+  SemanticSearchS3BucketName:
+    Description: S3 bucket name for the data
+    Type: String
+    Default: 'semantic-search-engine-s3'
+    MinLength: 1
+  
+  SemanticSearchDynamoDBName:
+    Description: DynamoDB table name
+    Type: String
+    Default: 'semantic-search-engine-dynamo'
+    MinLength: 1
+  
+  SemanticSearchCollectionName:
+    Description: OpenSearch collection name 
+    Type: String
+    MinLength: 1
+  
+  SemanticSearchIndexName:
+    Description: OpenSearch index name 
+    Type: String
+    MinLength: 1
+  
+  SemanticSearchCollectionEndpoint:
+    Description: OpenSearch collection endpoint without https://
+    Type: String
+    MinLength: 1
+  
+  SemanticSearchLambdaLayerNameVersion:
+    Description: Lambda layer name followed by version LambdaLayerName:Version
+    Type: String
+    Default: 'OpenSearchPy:1'
+  
+  SemanticSearchCollectionId:
+    Description: OpenSearch collection ID 
+    Type: String
+    MinLength: 1
+
+Resources:
+  SemanticSearchS3bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 
+                    - '${SemanticSearchS3BucketName}-${AWS::AccountId}'
+                    - SemanticSearchS3BucketName: !Ref SemanticSearchS3BucketName
+      AccessControl: Private
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt [ SemanticSearchCreateEmbedding, Arn]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+  
+  SemanticSearchS3LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    DependsOn: 
+     - SemanticSearchS3bucket
+     - SemanticSearchCreateEmbedding
+    Properties:
+      FunctionName: !GetAtt [SemanticSearchCreateEmbedding, Arn]
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn:
+        !GetAtt [ SemanticSearchS3bucket, Arn ]
+
+
+  SemanticSearchDynamoDBTable: 
+    Type: AWS::DynamoDB::Table
+    Properties: 
+      AttributeDefinitions: 
+        - 
+          AttributeName: "document_id"
+          AttributeType: "S"
+      KeySchema: 
+        - 
+          AttributeName: "document_id"
+          KeyType: "HASH"
+      ProvisionedThroughput: 
+        ReadCapacityUnits: "5"
+        WriteCapacityUnits: "5"
+      TableName: !Ref SemanticSearchDynamoDBName
+  
+  SemanticSearchAWSLambdaBasicExecution:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      Description: SemanticSearchAWSLambdaBasicExecution
+      Path: /
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Action:
+              - 'logs:CreateLogGroup'
+              - 'logs:CreateLogStream'
+              - 'logs:PutLogEvents'
+            Resource: 'arn:aws:logs:*:*:*'
+  
+  SemanticSearchGetSSMParameter:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      Description: SemanticSearchGetSSMParameter
+      Path: /
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Action:
+                - 'ssm:GetParameter'
+                - 'ssm:GetParameters'
+            Resource: [!Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/opensearch-search/*']
+
+  SemanticSearchGetDynamoDBItem:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      Description: SemanticSearchGetDynamoDBItem
+      Path: /
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Action:
+              - 'dynamodb:GetItem'
+              - 'dynamodb:GetRecords'
+            Resource: !Sub 
+                        - 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${SemanticSearchDynamoDBName}'
+                        - SemanticSearchDynamoDBName: !Ref SemanticSearchDynamoDBName
+  
+  SemanticSearchGetDocumentTextRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: semanticSearchGetDocumentTextRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: 'lambda.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !GetAtt SemanticSearchAWSLambdaBasicExecution.PolicyArn
+        - !GetAtt SemanticSearchGetSSMParameter.PolicyArn
+        - !GetAtt SemanticSearchGetDynamoDBItem.PolicyArn
+
+  SemanticSearchGetDocumentText:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt SemanticSearchGetDocumentTextRole.Arn
+      FunctionName: semanticSearchGetDocumentText
+      Runtime: python3.11
+      Timeout: 240
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import urllib.parse
+
+          ssm = boto3.client("ssm")
+
+          def get_ssm_parameter(parameter_name, with_decryption=False):
+              return ssm.get_parameter(Name=parameter_name, WithDecryption=with_decryption)["Parameter"]["Value"]
+              
+          DYNAMODB_TABLE_NAME = get_ssm_parameter("/opensearch-search/dynamodb")
+          REGION = get_ssm_parameter("/opensearch-search/region")
+
+          dynamodb = boto3.client('dynamodb', REGION)
+
+          def lambda_handler(event, context):
+
+              document_id = urllib.parse.unquote(event["queryStringParameters"]["document_id"])
+              
+              query = {'document_id': {'S': document_id}}
+
+              response = dynamodb.get_item(TableName=DYNAMODB_TABLE_NAME, Key=query)
+              
+              if 'Item' in response:
+                  text = response['Item']['text']['S']
+                  s3_file_path = response['Item']['s3_file_path']['S']
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({'text' :text, 's3_file_path': s3_file_path}),
+                      'headers': {
+                          "Access-Control-Allow-Methods": "GET,OPTIONS",
+                          "Access-Control-Allow-Origin": "*",
+                          "Access-Control-Allow-Headers": "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token",
+                          "Access-Control-Allow-Credentials": 'true'
+
+                      }
+                      
+                  }
+              else:
+                  return {
+                      'statusCode': 404,
+                      'body': json.dumps('Document ID not found'),
+                      'headers': {
+                          "Access-Control-Allow-Methods": "GET,OPTIONS",
+                          "Access-Control-Allow-Origin": "*",
+                          "Access-Control-Allow-Headers": "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token",
+                          "Access-Control-Allow-Credentials": 'true'
+                      }
+                  }
+
+  SemanticSearchInvokeBedrockModel:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      Description: InvokeBedrockModel
+      Path: /
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Action:
+              - 'bedrock:InvokeModel'
+            Resource: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v1'
+
+  SemanticSearchCollectionAPI:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      Description: SemanticSearchCollectionAPI
+      Path: /
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Action:
+              - 'aoss:APIAccessAll'
+            Resource: !Sub 
+                        - 'arn:aws:aoss:${AWS::Region}:${AWS::AccountId}:collection/${SemanticSearchCollectionId}'
+                        - SemanticSearchCollectionId: !Ref SemanticSearchCollectionId
+    
+  SemanticSearchQuerySearchIndexRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: semanticSearchQuerySearchIndexRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: 'lambda.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !GetAtt SemanticSearchAWSLambdaBasicExecution.PolicyArn
+        - !GetAtt SemanticSearchGetSSMParameter.PolicyArn
+        - !GetAtt SemanticSearchInvokeBedrockModel.PolicyArn
+        - !GetAtt SemanticSearchCollectionAPI.PolicyArn
+  
+  SemanticSearchQuerySearchIndex:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt SemanticSearchQuerySearchIndexRole.Arn
+      FunctionName: semanticSearchQuerySearchIndex
+      Runtime: python3.11
+      Timeout: 240
+      Layers:
+        - !Sub 
+          - 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:layer:${SemanticSearchLambdaLayerNameVersion}'
+          - SemanticSearchLambdaLayerNameVersion: !Ref SemanticSearchLambdaLayerNameVersion
+      Code:
+        ZipFile: |
+          import json
+          from opensearchpy import OpenSearch, RequestsHttpConnection, exceptions
+          from opensearchpy.helpers import bulk
+          from requests_aws4auth import AWS4Auth
+          import boto3
+          import urllib.parse
+
+          ssm = boto3.client("ssm")
+
+          def get_ssm_parameter(parameter_name, with_decryption=False):
+              return ssm.get_parameter(Name=parameter_name, WithDecryption=with_decryption)[
+                  "Parameter"
+              ]["Value"]
+              
+          ENDPOINT = get_ssm_parameter("/opensearch-search/endpoint")
+          REGION = get_ssm_parameter("/opensearch-search/region")
+          INDEX_NAME = get_ssm_parameter("/opensearch-search/index_name")
+
+          credentials = boto3.Session().get_credentials()
+
+          awsauth = AWS4Auth(
+              credentials.access_key,
+              credentials.secret_key,
+              REGION,
+              "aoss",
+              session_token=credentials.token,
+          )
+
+          ops_client = OpenSearch(
+              hosts=[{"host": ENDPOINT, "port": 443}],
+              http_auth=awsauth,
+              use_ssl=True,
+              verify_certs=True,
+              connection_class=RequestsHttpConnection,
+              timeout=300,
+          )
+          bedrock = boto3.client('bedrock-runtime')
+
+          def lambda_handler(event, context):
+
+              document = urllib.parse.unquote(event["queryStringParameters"]["text"])
+              
+              print(document)
+              
+              embedding = get_embedding(document)
+              
+              knn_query = {
+                              "size": 3,
+                              "query": {
+                                  "knn": {
+                                      "vector_field": {
+                                          "vector": embedding,  # The vector you want to search for
+                                          "k": 3  # Number of nearest neighbors to retrieve
+                                      }
+                                  }
+                              }
+                          }
+              response = ops_client.search(index=INDEX_NAME, body=knn_query)
+              
+              result = list()
+              
+              for hit in response['hits']['hits']:
+                  result.append({'score': hit['_score'], 'document_id': hit['_source']['document_id']})
+              
+              return ({
+                  'statusCode': 200,
+                  'body': json.dumps(result),
+                  'headers': {
+                      "Access-Control-Allow-Methods": "GET,OPTIONS",
+                      "Access-Control-Allow-Origin": "*",
+                      "Access-Control-Allow-Headers": "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token",
+                      "Access-Control-Allow-Credentials": 'true'
+
+                  }
+              })
+
+          def get_embedding(document):
+                  data_body = json.dumps({"inputText": document})
+                  modelId = "amazon.titan-embed-text-v1"
+                  accept = "*/*"
+                  contentType = "application/json"
+
+                  response = bedrock.invoke_model(
+                      body=data_body, modelId=modelId, accept=accept, contentType=contentType
+                  )
+
+                  data_embedding = json.loads(response.get("body").read())["embedding"]
+
+                  return data_embedding
+  
+  SemanticSearchPutObjectS3:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      Description: SemanticSearchPutObjectS3
+      Path: /
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Action:
+              - 's3:PutObject'
+              - 's3:PutObjectAcl'
+            Resource: !Sub 
+                        - 'arn:aws:s3:::${SemanticSearchS3BucketName}-${AWS::AccountId}/*'
+                        - SemanticSearchS3BucketName: !Ref SemanticSearchS3BucketName
+  
+  SemanticSearchUploadTextRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: semanticSearchUploadTextRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: 'lambda.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !GetAtt SemanticSearchAWSLambdaBasicExecution.PolicyArn
+        - !GetAtt SemanticSearchGetSSMParameter.PolicyArn
+        - !GetAtt SemanticSearchPutObjectS3.PolicyArn
+
+  SemanticSearchUploadText:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt SemanticSearchUploadTextRole.Arn
+      FunctionName: semanticSearchUploadText
+      Runtime: python3.11
+      Timeout: 240
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+
+          s3 = boto3.client("s3")
+          ssm = boto3.client("ssm")
+
+          def get_ssm_parameter(parameter_name, with_decryption=False):
+              return ssm.get_parameter(Name=parameter_name, WithDecryption=with_decryption)[
+                  "Parameter"
+              ]["Value"]
+              
+          BUCKET = get_ssm_parameter("/opensearch-search/bucket")
+
+          def lambda_handler(event, context):
+
+              document = event["queryStringParameters"]["document"]
+              
+              filename = f"{abs(hash(document))}.txt"
+              s3.put_object(Bucket=BUCKET, Key=filename, Body=document.encode('utf-8'))
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(os.path.join(BUCKET, filename)),
+                  'headers': {
+                      "Access-Control-Allow-Methods": "PUT,OPTIONS",
+                      "Access-Control-Allow-Origin": "*",
+                      "Access-Control-Allow-Headers": "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token",
+                      "Access-Control-Allow-Credentials": 'true'
+
+                  }
+              }
+
+  SemanticSearchAPIGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Description: Semantic Search API
+      EndpointConfiguration:
+        Types:
+          - REGIONAL        
+      Name: semantic-search-API
+      Body:
+        swagger: '2.0'
+        paths:
+          /document:
+            get:
+              produces:
+              - "application/json"
+              parameters:
+              - name: "document_id"
+                in: "query"
+                required: true
+                type: "string"
+              responses:
+                "200":
+                  description: "200 response"
+                  schema:
+                    $ref: "#/definitions/Empty"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                httpMethod: "POST"
+                uri: !Sub 
+                      - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdarn}/invocations"
+                      - lambdarn: !GetAtt SemanticSearchGetDocumentText.Arn
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                passthroughBehavior: "when_no_match"
+                contentHandling: "CONVERT_TO_TEXT"
+                type: "aws_proxy"
+            options:
+              consumes:
+              - "application/json"
+              produces:
+              - "application/json"
+              responses:
+                "200":
+                  description: "200 response"
+                  schema:
+                    $ref: "#/definitions/Empty"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+                    Access-Control-Allow-Methods:
+                      type: "string"
+                    Access-Control-Allow-Headers:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+                      method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                requestTemplates:
+                  application/json: "{\"statusCode\": 200}"
+                passthroughBehavior: "when_no_match"
+                type: "mock"
+          /query:
+            get:
+              produces:
+              - "application/json"
+              parameters:
+              - name: "text"
+                in: "query"
+                required: true
+                type: "string"
+              responses:
+                "200":
+                  description: "200 response"
+                  schema:
+                    $ref: "#/definitions/Empty"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                httpMethod: "POST"
+                uri: !Sub 
+                      - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdarn}/invocations"
+                      - lambdarn: !GetAtt SemanticSearchQuerySearchIndex.Arn
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                passthroughBehavior: "when_no_match"
+                contentHandling: "CONVERT_TO_TEXT"
+                type: "aws_proxy"
+            options:
+              consumes:
+              - "application/json"
+              produces:
+              - "application/json"
+              responses:
+                "200":
+                  description: "200 response"
+                  schema:
+                    $ref: "#/definitions/Empty"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+                    Access-Control-Allow-Methods:
+                      type: "string"
+                    Access-Control-Allow-Headers:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+                      method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                requestTemplates:
+                  application/json: "{\"statusCode\": 200}"
+                passthroughBehavior: "when_no_match"
+                type: "mock"
+          /upload:
+            get:
+              produces:
+              - "application/json"
+              parameters:
+              - name: "document"
+                in: "query"
+                required: true
+                type: "string"
+              responses:
+                "200":
+                  description: "200 response"
+                  schema:
+                    $ref: "#/definitions/Empty"
+              x-amazon-apigateway-integration:
+                httpMethod: "POST"
+                uri: !Sub 
+                      - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdarn}/invocations"
+                      - lambdarn: !GetAtt SemanticSearchUploadText.Arn
+                responses:
+                  default:
+                    statusCode: "200"
+                passthroughBehavior: "when_no_match"
+                contentHandling: "CONVERT_TO_TEXT"
+                type: "aws_proxy"
+            options:
+              consumes:
+              - "application/json"
+              produces:
+              - "application/json"
+              responses:
+                "200":
+                  description: "200 response"
+                  schema:
+                    $ref: "#/definitions/Empty"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+                    Access-Control-Allow-Methods:
+                      type: "string"
+                    Access-Control-Allow-Headers:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Methods: "'OPTIONS,PUT'"
+                      method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                requestTemplates:
+                  application/json: "{\"statusCode\": 200}"
+                passthroughBehavior: "when_no_match"
+                type: "mock"
+  
+  SemanticSearchAPIGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+     - SemanticSearchAPIGateway
+    Properties:
+      RestApiId: !Ref SemanticSearchAPIGateway
+      StageName: dev
+  
+  SemanticSearchGetObjectS3:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      Description: SemanticSearchGetObjectS3
+      Path: /
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Action:
+              - 's3:GetObject'
+              - 's3:GetObjectAcl'
+            Resource: !Sub 
+                        - 'arn:aws:s3:::${SemanticSearchS3BucketName}-${AWS::AccountId}/*'
+                        - SemanticSearchS3BucketName: !Ref SemanticSearchS3BucketName
+  
+  SemanticSearchPutDynamoDBItem:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      Description: SemanticSearchPutDynamoDBItem
+      Path: /
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Action:
+              - 'dynamodb:PutItem'
+            Resource: !Sub 
+                        - 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${SemanticSearchDynamoDBName}'
+                        - SemanticSearchDynamoDBName: !Ref SemanticSearchDynamoDBName
+    
+  SemanticSearchCreateEmbeddingRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: SemanticSearchCreateEmbeddingRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: 'lambda.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !GetAtt SemanticSearchAWSLambdaBasicExecution.PolicyArn
+        - !GetAtt SemanticSearchGetSSMParameter.PolicyArn
+        - !GetAtt SemanticSearchCollectionAPI.PolicyArn
+        - !GetAtt SemanticSearchInvokeBedrockModel.PolicyArn
+        - !GetAtt SemanticSearchGetObjectS3.PolicyArn
+        - !GetAtt SemanticSearchGetDynamoDBItem.PolicyArn
+        - !GetAtt SemanticSearchPutDynamoDBItem.PolicyArn
+
+  SemanticSearchCreateEmbedding:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt SemanticSearchCreateEmbeddingRole.Arn
+      FunctionName: semanticSearchCreateEmbedding
+      Runtime: python3.11
+      Timeout: 240
+      Layers:
+        - !Sub 
+          - 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:layer:${SemanticSearchLambdaLayerNameVersion}'
+          - SemanticSearchLambdaLayerNameVersion: !Ref SemanticSearchLambdaLayerNameVersion
+      Code:
+        ZipFile: |
+          import json
+          from opensearchpy import OpenSearch, RequestsHttpConnection, exceptions
+          from opensearchpy.helpers import bulk
+          from requests_aws4auth import AWS4Auth
+          import boto3
+          import random
+          import os
+
+          ssm = boto3.client("ssm")
+
+          def get_ssm_parameter(parameter_name, with_decryption=False):
+              return ssm.get_parameter(Name=parameter_name, WithDecryption=with_decryption)[
+                  "Parameter"
+              ]["Value"]
+              
+          ENDPOINT = get_ssm_parameter("/opensearch-search/endpoint")
+          REGION = get_ssm_parameter("/opensearch-search/region")
+          INDEX_NAME = get_ssm_parameter("/opensearch-search/index_name")
+          DYNAMODB_TABLE_NAME = get_ssm_parameter("/opensearch-search/dynamodb")
+
+          credentials = boto3.Session().get_credentials()
+
+          awsauth = AWS4Auth(
+              credentials.access_key,
+              credentials.secret_key,
+              REGION,
+              "aoss",
+              session_token=credentials.token,
+          )
+
+
+          ops_client = OpenSearch(
+              hosts=[{"host": ENDPOINT, "port": 443}],
+              http_auth=awsauth,
+              use_ssl=True,
+              verify_certs=True,
+              connection_class=RequestsHttpConnection,
+              timeout=300,
+          )
+          bedrock = boto3.client('bedrock-runtime')
+          s3 = boto3.client('s3')
+          dynamodb = boto3.client('dynamodb', REGION)
+
+          def lambda_handler(event, context):
+
+              for e in event["Records"]:
+                  bucket_name = e["s3"]["bucket"]["name"]
+                  file_key = e["s3"]["object"]["key"]
+                  
+                  response = s3.get_object(Bucket=bucket_name, Key=file_key)
+              
+                  # Read the content of the file
+                  document = response['Body'].read().decode('utf-8')
+                  
+                  document_id = str(abs(hash(document)))
+                  
+                  if check_item_exist(document_id):
+                      print("Document Exist")
+                      continue
+                  
+                  embedding = get_embedding(document)
+                  
+                  
+                  save_text_embedding(document_id, document, embedding, os.path.join(bucket_name, file_key))
+
+              return {
+                  'statusCode': 200,
+                  'body': "complete"
+              }
+
+          def save_text_embedding(document_id, text, vector_field, s3_file_path):
+              item = {
+                  "document_id": {"S": str(document_id)},
+                  "text": {"S": text},
+                  "vector_field": {"L": [{"N": str(vector)} for vector in vector_field]},
+                  "s3_file_path": {"S": s3_file_path},
+              }
+
+              dynamodb.put_item(
+                  TableName=DYNAMODB_TABLE_NAME, Item=item
+              )
+              
+              index_opensearch(document_id, text, vector_field)
+
+          def get_embedding(document):
+                  data_body = json.dumps({"inputText": document})
+                  modelId = "amazon.titan-embed-text-v1"
+                  accept = "*/*"
+                  contentType = "application/json"
+
+                  response = bedrock.invoke_model(
+                      body=data_body, modelId=modelId, accept=accept, contentType=contentType
+                  )
+
+                  data_embedding = json.loads(response.get("body").read())["embedding"]
+
+                  return data_embedding
+              
+          def index_opensearch(document_id, text, vector_field):
+              document = {
+                'vector_field': vector_field,
+                'document_id': document_id,
+              }
+              
+              response = ops_client.index(
+                  index = INDEX_NAME,
+                  body = document,
+                  )
+              print(response)
+
+          def check_item_exist(document_id):
+              key_to_check = {'document_id': {'S': document_id}}
+              
+              response = dynamodb.get_item(TableName=DYNAMODB_TABLE_NAME, Key=key_to_check)
+              
+              if 'Item' in response:
+                  return True
+              else:
+                  return False
+
+  SemanticSearchCollectionParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: '/opensearch-search/name'
+      Type: String
+      Value: !Ref SemanticSearchCollectionName
+      Description: SSM Parameter for OpenSearch Collection Name
+  
+  SemanticSearchBucketParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: '/opensearch-search/bucket'
+      Type: String
+      Value: !Sub 
+              - '${SemanticSearchS3BucketName}-${AWS::AccountId}'
+              - SemanticSearchS3BucketName: !Ref SemanticSearchS3BucketName
+      Description: SSM Parameter for S3 Bucket name
+  
+  SemanticSearchDynamoDBParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: '/opensearch-search/dynamodb'
+      Type: String
+      Value: !Ref SemanticSearchDynamoDBName
+      Description: SSM Parameter for DynamoDB name
+
+  SemanticSearchIndexParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: '/opensearch-search/index_name'
+      Type: String
+      Value: !Ref SemanticSearchIndexName
+      Description: SSM Parameter for OpenSearch Index Name
+  
+  SemanticSearchRegionParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: '/opensearch-search/region'
+      Type: String
+      Value: !Sub '${AWS::Region}'
+      Description: SSM Parameter for Region
+  
+  SemanticSearchCollectionEndpointParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: '/opensearch-search/endpoint'
+      Type: String
+      Value: !Ref SemanticSearchCollectionEndpoint
+      Description: SSM Parameter for OpenSearch Collection Endpoint
+  
+  GetDocumentTextAPIInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt SemanticSearchGetDocumentText.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub
+                  - "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${SemanticSearchAPIGateway}/*/GET/document"
+                  - SemanticSearchAPIGateway: !Ref SemanticSearchAPIGateway
+  
+  QuerySearchIndexAPIInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt SemanticSearchQuerySearchIndex.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 
+                  - "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${SemanticSearchAPIGateway}/*/GET/query"
+                  - SemanticSearchAPIGateway: !Ref SemanticSearchAPIGateway
+  
+  SearchUploadTextAPIInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt SemanticSearchUploadText.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 
+                  - "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${SemanticSearchAPIGateway}/*/GET/upload"
+                  - SemanticSearchAPIGateway: !Ref SemanticSearchAPIGateway
+
+Outputs:
+  SemanticSearchAPIGatewayInvokeURL:
+    Value: !Sub https://${SemanticSearchAPIGateway}.execute-api.${AWS::Region}.amazonaws.com/dev
+  
+  SemanticSearchQuerySearchIndexRole:
+      Value: !GetAtt SemanticSearchQuerySearchIndexRole.Arn
+ 
+  SemanticSearchCreateEmbeddingRole:
+      Value: !GetAtt SemanticSearchCreateEmbeddingRole.Arn
+
+  SemanticSearchS3BucketName:
+      Value: !Sub 
+              - '${SemanticSearchS3BucketName}-${AWS::AccountId}'
+              - SemanticSearchS3BucketName: !Ref SemanticSearchS3BucketName
